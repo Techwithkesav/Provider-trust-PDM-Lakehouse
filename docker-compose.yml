@@ -1,0 +1,97 @@
+# docker-compose.yml
+# Defines our local data platform: S3-style storage (MinIO) + Spark engine.
+# `docker compose up` reads this file and starts everything.
+
+services:
+  # ---------- MinIO: local stand-in for Amazon S3 ----------
+  minio:
+    image: minio/minio:latest          # the software package to run
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      # reads username/password from our .env file
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # the storage API (how code talks to it)
+      - "9001:9001"   # the web dashboard (how you view it in a browser)
+    volumes:
+      - minio-data:/data               # keeps data even if container restarts
+    healthcheck:                       # lets other services wait until MinIO is ready
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------- MinIO-init: creates our storage bucket, then exits ----------
+  minio-init:
+    image: minio/mc:latest             # "mc" = MinIO Client, a command-line tool
+    depends_on:
+      minio:
+        condition: service_healthy     # wait until MinIO is up before running
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      mc mb -p local/lakehouse;
+      echo 'Bucket lakehouse is ready';
+      exit 0;"
+
+  # ---------- Spark: the data processing engine ----------
+  spark:
+    image: apache/spark:3.5.1            # official Apache Spark image
+    container_name: spark
+    command: >
+      /opt/spark/sbin/start-master.sh --host 0.0.0.0
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+    ports:
+      - "8080:8080"   # Spark's web dashboard
+      - "7077:7077"   # internal port Spark uses to coordinate work
+    volumes:
+      - ./:/opt/app   # makes your project folder visible inside the container
+
+  # ---------- Postgres: the database Airflow uses to store run history ----------
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"   # standard Postgres port
+    volumes:
+      - postgres-data:/var/lib/postgresql/data   # keeps Airflow history across restarts
+    healthcheck:                                 # lets Airflow wait until the DB is ready
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+ # ---------- Airflow: orchestrates the pipeline (delegates Spark to spark container) ----------
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    ports:
+      - "8081:8080"
+    user: "0:0"                            # root, so it can use the Docker socket
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./:/opt/app
+      - /var/run/docker.sock:/var/run/docker.sock     # control Docker on the host
+    command: bash -c "airflow db migrate && airflow standalone"
+# named storage that survives restarts
+volumes:
+  minio-data:
+  postgres-data:
